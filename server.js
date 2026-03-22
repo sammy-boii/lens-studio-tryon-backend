@@ -11,7 +11,19 @@ const { Vibrant } = require('node-vibrant/node')
 const app = express()
 const PORT = 3000
 
-app.use(cors())
+app.use(
+  cors({
+    origin: '*',
+    methods: ['GET', 'POST'],
+    allowedHeaders: ['Content-Type', 'ngrok-skip-browser-warning']
+  })
+)
+
+app.use((req, res, next) => {
+  res.setHeader('ngrok-skip-browser-warning', 'true')
+  next()
+})
+
 app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
 app.use('/textures', express.static(path.join(__dirname, 'public/textures')))
@@ -192,7 +204,11 @@ app.post('/process-garment', upload.single('image'), async (req, res) => {
 
     console.log('Saved:', filename)
 
-    const textureUrl = `http://localhost:${PORT}/textures/${filename}`
+    const BASE_URL =
+      'https://nickolas-aciniform-misunderstandingly.ngrok-free.dev'
+
+    const textureUrl = `${BASE_URL}/textures/${filename}`
+
     res.json({ success: true, texture: textureUrl })
   } catch (error) {
     console.error('Failed:', error)
