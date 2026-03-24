@@ -4,20 +4,14 @@ const cors = require('cors')
 const path = require('path')
 const fs = require('fs')
 const { v4: uuidv4 } = require('uuid')
-const { removeBackground } = require('@imgly/background-removal-node')
-const { Jimp } = require('jimp')
-const { Vibrant } = require('node-vibrant/node')
+// const { Jimp } = require('jimp')
+
+const sharp = require('sharp')
 
 const app = express()
 const PORT = 3000
 
-app.use(
-  cors({
-    origin: '*',
-    methods: ['GET', 'POST'],
-    allowedHeaders: ['Content-Type', 'ngrok-skip-browser-warning']
-  })
-)
+app.use(cors({ origin: '*' }))
 
 app.use((req, res, next) => {
   res.setHeader('ngrok-skip-browser-warning', 'true')
@@ -26,7 +20,15 @@ app.use((req, res, next) => {
 
 app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
-app.use('/textures', express.static(path.join(__dirname, 'public/textures')))
+app.use(
+  '/textures',
+  (req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*')
+    res.setHeader('ngrok-skip-browser-warning', 'true')
+    next()
+  },
+  express.static(path.join(__dirname, 'public/textures'))
+)
 
 const outputDir = path.join(__dirname, 'public/textures')
 if (!fs.existsSync(outputDir)) {
@@ -141,38 +143,172 @@ function makeSeamless(img) {
   return img
 }
 
-async function extractTexture(imageBuffer) {
-  const img = await Jimp.read(imageBuffer)
-  const w = img.bitmap.width
-  const h = img.bitmap.height
+async function cropCenter(imageBuffer) {
+  const image = sharp(imageBuffer)
+  const metadata = await image.metadata()
 
-  // Crop center patch
-  const patchSize = Math.floor(Math.min(w, h) * 0.25)
-  const patchX = Math.floor(w / 2) - Math.floor(patchSize / 2)
-  const patchY = Math.floor(h * 0.35) - Math.floor(patchSize / 2)
+  // Smaller ratio means a tighter center crop (more zoom-in).
+  const CENTER_CROP_RATIO = 0.25
+  const baseSize = Math.min(metadata.width, metadata.height)
+  const size = Math.max(1, Math.floor(baseSize * CENTER_CROP_RATIO))
 
-  console.log(`Patch: ${patchX},${patchY} size ${patchSize}x${patchSize}`)
+  const croppedBuffer = await image
+    .extract({
+      left: Math.floor((metadata.width - size) / 2),
+      top: Math.floor((metadata.height - size) / 2),
+      width: size,
+      height: size
+    })
+    .resize(512, 512)
+    .png()
+    .toBuffer()
 
-  const patch = img.clone().crop({
-    x: patchX,
-    y: patchY,
-    w: patchSize,
-    h: patchSize
-  })
+  // 🔥 DEBUG: save cropped image
+  const filepath = path.join(outputDir, 'cropped.png')
+  fs.writeFileSync(filepath, croppedBuffer)
 
-  // Resize patch to 512x512
-  patch.resize({ w: 512, h: 512 })
-
-  // Tile 2x2 into 1024x1024
-  const final = new Jimp({ width: 1024, height: 1024, color: 0xffffffff })
-  final.composite(patch, 0, 0)
-  final.composite(patch, 512, 0)
-  final.composite(patch, 0, 512)
-  final.composite(patch, 512, 512)
-
-  return await final.getBuffer('image/png')
+  return croppedBuffer
 }
 
+async function extractTextureWithComfyUI(imageBuffer) {
+  // 🔥 STEP 0: Crop center (VERY IMPORTANT)
+  const cropped = await cropCenter(imageBuffer)
+  console.log('CROPPED')
+
+  // Convert to base64
+  const base64 = cropped.toString('base64')
+
+  // Upload image
+  const formData = new FormData()
+  const blob = new Blob([cropped], { type: 'image/png' })
+  formData.append('image', blob, 'input.png')
+
+  const uploadRes = await fetch('http://127.0.0.1:8188/upload/image', {
+    method: 'POST',
+    body: formData
+  })
+
+  const uploadData = await uploadRes.json()
+  const imageName = uploadData.name
+
+  // 🔥 WORKFLOW
+  const workflow = {
+    1: {
+      class_type: 'CheckpointLoaderSimple',
+      inputs: {
+        ckpt_name: 'v1-5-pruned-emaonly.safetensors'
+      }
+    },
+
+    2: {
+      class_type: 'LoadImage',
+      inputs: { image: imageName }
+    },
+
+    3: {
+      class_type: 'VAEEncode',
+      inputs: { pixels: ['2', 0], vae: ['1', 2] }
+    },
+
+    // ✅ Positive prompt
+    4: {
+      class_type: 'CLIPTextEncode',
+      inputs: {
+        text: 'seamless repeating checkerboard fabric texture, black and gray squares, perfectly tileable, flat scan, no folds, no clothing shape, uniform lighting, texture map',
+        clip: ['1', 1]
+      }
+    },
+
+    // ❌ Negative prompt
+    5: {
+      class_type: 'CLIPTextEncode',
+      inputs: {
+        text: '3d, folds, wrinkles, hoodie, sleeves, collar, perspective, shadows, lighting gradient, depth, object shape',
+        clip: ['1', 1]
+      }
+    },
+
+    // 🔥 TILE CONTROLNET
+    6: {
+      class_type: 'ControlNetLoader',
+      inputs: {
+        control_net_name: 'control_v11f1e_sd15_tile_fp16.safetensors'
+      }
+    },
+
+    7: {
+      class_type: 'ControlNetApplyAdvanced',
+      inputs: {
+        positive: ['4', 0],
+        negative: ['5', 0],
+        control_net: ['6', 0],
+        image: ['2', 0],
+        strength: 1.0,
+        start_percent: 0.0,
+        end_percent: 1.0
+      }
+    },
+
+    // 🔥 SAMPLER (KEY FIXES HERE)
+    8: {
+      class_type: 'KSampler',
+      inputs: {
+        model: ['1', 0],
+        positive: ['7', 0],
+        negative: ['7', 1],
+        latent_image: ['3', 0],
+        seed: Math.floor(Math.random() * 1000000),
+        steps: 30,
+        cfg: 7,
+        sampler_name: 'dpmpp_2m',
+        scheduler: 'karras',
+        denoise: 0.8 // 🔥 VERY IMPORTANT
+      }
+    },
+
+    9: {
+      class_type: 'VAEDecode',
+      inputs: { samples: ['8', 0], vae: ['1', 2] }
+    },
+
+    10: {
+      class_type: 'SaveImage',
+      inputs: {
+        images: ['9', 0],
+        filename_prefix: 'texture'
+      }
+    }
+  }
+
+  // Send prompt
+  const promptRes = await fetch('http://127.0.0.1:8188/prompt', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt: workflow })
+  })
+
+  const promptData = await promptRes.json()
+  const promptId = promptData.prompt_id
+
+  // Poll result
+  while (true) {
+    await new Promise((r) => setTimeout(r, 1000))
+
+    const historyRes = await fetch(`http://127.0.0.1:8188/history/${promptId}`)
+    const history = await historyRes.json()
+
+    if (history[promptId]) {
+      const outputs = history[promptId].outputs
+      const imageInfo = outputs['10'].images[0]
+
+      const imgRes = await fetch(
+        `http://127.0.0.1:8188/view?filename=${imageInfo.filename}&subfolder=${imageInfo.subfolder}&type=${imageInfo.type}`
+      )
+
+      return Buffer.from(await imgRes.arrayBuffer())
+    }
+  }
+}
 // -------------------------------------------------------
 // Routes
 // -------------------------------------------------------
@@ -194,7 +330,7 @@ app.post('/process-garment', upload.single('image'), async (req, res) => {
 
     console.log('Extracting texture...')
     // const textureBuffer = await extractTexture(cleanBuffer)
-    const textureBuffer = await extractTexture(req.file.buffer)
+    const textureBuffer = await extractTextureWithComfyUI(req.file.buffer)
 
     const filename = `${uuidv4()}.png`
     const filepath = path.join(outputDir, filename)

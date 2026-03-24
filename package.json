@@ -12,12 +12,15 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@fal-ai/client": "^1.9.4",
+    "@huggingface/inference": "^4.13.15",
     "@imgly/background-removal-node": "^1.4.5",
     "cors": "^2.8.6",
     "express": "^5.2.1",
     "jimp": "^1.6.0",
     "multer": "^2.1.1",
     "node-vibrant": "^4.0.4",
+    "sharp": "^0.34.5",
     "uuid": "^13.0.0"
   }
 }
