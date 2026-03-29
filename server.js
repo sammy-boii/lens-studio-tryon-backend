@@ -56,108 +56,20 @@ let textureVersion = 0
 const CANDIDATE_SIZE = 256
 const FINAL_TILE_SIZE = 1024
 const MIN_SEAMLESS_SCORE = 0.42
+const DEFAULT_DEBUG_MODE = false
+
+const GARMENT_SAMPLING_PROFILES = {
+  tshirt: { scales: [0.36, 0.42, 0.48], grid: 7 },
+  sweatshirt: { scales: [0.42, 0.5, 0.58], grid: 7 },
+  hoodie: { scales: [0.42, 0.5, 0.58], grid: 7 },
+  jacket: { scales: [0.46, 0.54, 0.62], grid: 7 },
+  coat: { scales: [0.5, 0.58, 0.66], grid: 7 },
+  default: { scales: [0.4, 0.48, 0.56], grid: 7 }
+}
 
 // -------------------------------------------------------
 // Helpers
 // -------------------------------------------------------
-
-function getAverageColor(img) {
-  const data = img.bitmap.data
-  let r = 0,
-    g = 0,
-    b = 0,
-    count = 0
-  for (let i = 0; i < data.length; i += 4) {
-    if (data[i + 3] > 128) {
-      r += data[i]
-      g += data[i + 1]
-      b += data[i + 2]
-      count++
-    }
-  }
-  if (count === 0) return { r: 128, g: 128, b: 128 }
-  return {
-    r: Math.round(r / count),
-    g: Math.round(g / count),
-    b: Math.round(b / count)
-  }
-}
-
-function findGarmentBounds(img) {
-  const data = img.bitmap.data
-  const w = img.bitmap.width
-  const h = img.bitmap.height
-  let minX = w,
-    maxX = 0,
-    minY = h,
-    maxY = 0
-
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const idx = (y * w + x) * 4
-      if (data[idx + 3] > 10) {
-        if (x < minX) minX = x
-        if (x > maxX) maxX = x
-        if (y < minY) minY = y
-        if (y > maxY) maxY = y
-      }
-    }
-  }
-  return { minX, maxX, minY, maxY }
-}
-
-function flattenAlpha(img, avgColor) {
-  const data = img.bitmap.data
-  for (let i = 0; i < data.length; i += 4) {
-    if (data[i + 3] < 128) {
-      data[i] = avgColor.r
-      data[i + 1] = avgColor.g
-      data[i + 2] = avgColor.b
-      data[i + 3] = 255
-    } else {
-      data[i + 3] = 255
-    }
-  }
-  return img
-}
-
-function makeSeamless(img) {
-  const w = img.bitmap.width
-  const h = img.bitmap.height
-  const data = img.bitmap.data
-  const blendW = Math.floor(w * 0.15)
-  const blendH = Math.floor(h * 0.15)
-
-  // Blend left/right edges
-  for (let x = 0; x < blendW; x++) {
-    const t = x / blendW
-    for (let y = 0; y < h; y++) {
-      const idxL = (y * w + x) * 4
-      const idxR = (y * w + (w - 1 - x)) * 4
-      for (let c = 0; c < 3; c++) {
-        data[idxL + c] = Math.round(
-          data[idxL + c] * (1 - t) + data[idxR + c] * t
-        )
-      }
-    }
-  }
-
-  // Blend top/bottom edges
-  for (let y = 0; y < blendH; y++) {
-    const t = y / blendH
-    for (let x = 0; x < w; x++) {
-      const idxT = (y * w + x) * 4
-      const idxB = ((h - 1 - y) * w + x) * 4
-      for (let c = 0; c < 3; c++) {
-        data[idxT + c] = Math.round(
-          data[idxT + c] * (1 - t) + data[idxB + c] * t
-        )
-      }
-    }
-  }
-
-  return img
-}
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value))
@@ -269,171 +181,6 @@ function estimateBorderColor(rawBuffer, width, height, channels) {
     r: Math.round(r / count),
     g: Math.round(g / count),
     b: Math.round(b / count)
-  }
-}
-
-function detectForegroundBounds(rawBuffer, width, height, channels, bgColor) {
-  const thresholdSq = 24 * 24
-
-  let minX = width
-  let minY = height
-  let maxX = -1
-  let maxY = -1
-  let fgCount = 0
-
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const idx = (y * width + x) * channels
-      const distSq = rgbDistanceSq(
-        rawBuffer[idx],
-        rawBuffer[idx + 1],
-        rawBuffer[idx + 2],
-        bgColor.r,
-        bgColor.g,
-        bgColor.b
-      )
-
-      // Treat pixels far from border color as foreground fabric.
-      if (distSq > thresholdSq) {
-        fgCount++
-        if (x < minX) minX = x
-        if (x > maxX) maxX = x
-        if (y < minY) minY = y
-        if (y > maxY) maxY = y
-      }
-    }
-  }
-
-  if (fgCount < width * height * 0.02 || maxX < minX || maxY < minY) {
-    return { minX: 0, minY: 0, maxX: width - 1, maxY: height - 1 }
-  }
-
-  const padX = Math.floor(width * 0.04)
-  const padY = Math.floor(height * 0.04)
-
-  return {
-    minX: clamp(minX - padX, 0, width - 1),
-    minY: clamp(minY - padY, 0, height - 1),
-    maxX: clamp(maxX + padX, 0, width - 1),
-    maxY: clamp(maxY + padY, 0, height - 1)
-  }
-}
-
-function createForegroundMask(rawBuffer, width, height, channels, bgColor) {
-  const thresholdSq = 24 * 24
-  const mask = new Uint8Array(width * height)
-
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const idx = (y * width + x) * channels
-      const distSq = rgbDistanceSq(
-        rawBuffer[idx],
-        rawBuffer[idx + 1],
-        rawBuffer[idx + 2],
-        bgColor.r,
-        bgColor.g,
-        bgColor.b
-      )
-      mask[y * width + x] = distSq > thresholdSq ? 1 : 0
-    }
-  }
-
-  return mask
-}
-
-function estimateForegroundCoverage(
-  mask,
-  maskWidth,
-  maskHeight,
-  left,
-  top,
-  cropSize,
-  imageWidth,
-  imageHeight
-) {
-  const sx = maskWidth / imageWidth
-  const sy = maskHeight / imageHeight
-
-  const l = clamp(Math.floor(left * sx), 0, maskWidth - 1)
-  const t = clamp(Math.floor(top * sy), 0, maskHeight - 1)
-  const r = clamp(Math.ceil((left + cropSize) * sx), l + 1, maskWidth)
-  const b = clamp(Math.ceil((top + cropSize) * sy), t + 1, maskHeight)
-
-  let fg = 0
-  let total = 0
-  for (let y = t; y < b; y++) {
-    for (let x = l; x < r; x++) {
-      fg += mask[y * maskWidth + x]
-      total++
-    }
-  }
-
-  if (total === 0) return 0
-  return fg / total
-}
-
-function estimateForegroundStats(rawBuffer, width, height, channels, mask) {
-  let count = 0
-  let sumR = 0
-  let sumG = 0
-  let sumB = 0
-  let sumL = 0
-  let sumL2 = 0
-  let sumA = 0
-  let sumBch = 0
-  let sumA2 = 0
-  let sumBch2 = 0
-
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const m = mask[y * width + x]
-      if (!m) continue
-
-      const idx = (y * width + x) * channels
-      const r = rawBuffer[idx]
-      const g = rawBuffer[idx + 1]
-      const b = rawBuffer[idx + 2]
-
-      const lab = rgbToLab(r, g, b)
-
-      count++
-      sumR += r
-      sumG += g
-      sumB += b
-      sumL += lab.l
-      sumL2 += lab.l * lab.l
-      sumA += lab.a
-      sumBch += lab.b
-      sumA2 += lab.a * lab.a
-      sumBch2 += lab.b * lab.b
-    }
-  }
-
-  if (count === 0) {
-    return {
-      fgRatio: 0,
-      meanR: 128,
-      meanG: 128,
-      meanB: 128,
-      lStd: 100,
-      chromaStd: 100
-    }
-  }
-
-  const meanL = sumL / count
-  const meanA = sumA / count
-  const meanBch = sumBch / count
-  const lVar = Math.max(0, sumL2 / count - meanL * meanL)
-  const aVar = Math.max(0, sumA2 / count - meanA * meanA)
-  const bVar = Math.max(0, sumBch2 / count - meanBch * meanBch)
-
-  return {
-    fgRatio: count / (width * height),
-    meanR: Math.round(sumR / count),
-    meanG: Math.round(sumG / count),
-    meanB: Math.round(sumB / count),
-    lStd: Math.sqrt(lVar),
-    chromaStd: Math.sqrt((aVar + bVar) * 0.5)
   }
 }
 
@@ -985,11 +732,11 @@ function normalizePatchLighting(rawBuffer, width, height, channels, meanColor) {
     const lum = luminance(r, g, b)
     const sat = saturationApprox(r, g, b)
 
-    let targetLum = meanLum + (lum - meanLum) * 0.58
+    let targetLum = meanLum + (lum - meanLum) * 0.74
 
     // Gently compress very bright low-saturation pixels to avoid residual studio glare.
     if (lum > meanLum + lumRange * 0.45 && sat < 0.2) {
-      targetLum -= (lum - meanLum) * 0.18
+      targetLum -= (lum - meanLum) * 0.1
     }
 
     targetLum = clamp(targetLum, 14, 242)
@@ -1017,6 +764,68 @@ function detectPatternType(stats) {
   return 'print'
 }
 
+function toBooleanFlag(value, fallback = false) {
+  if (value === undefined || value === null || value === '') return fallback
+  if (typeof value === 'boolean') return value
+  const text = String(value).toLowerCase().trim()
+  return text === '1' || text === 'true' || text === 'yes' || text === 'on'
+}
+
+function parseMinScore(value, fallback) {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return fallback
+  return clamp(parsed, 0, 1)
+}
+
+function getSamplingProfile(garmentType) {
+  const key = String(garmentType || '').toLowerCase()
+  return GARMENT_SAMPLING_PROFILES[key] || GARMENT_SAMPLING_PROFILES.default
+}
+
+function quantizeColor(color, bucketSize = 18) {
+  return {
+    r: clamp(Math.round(color.r / bucketSize) * bucketSize, 0, 255),
+    g: clamp(Math.round(color.g / bucketSize) * bucketSize, 0, 255),
+    b: clamp(Math.round(color.b / bucketSize) * bucketSize, 0, 255)
+  }
+}
+
+function colorDistance(c1, c2) {
+  const dr = c1.r - c2.r
+  const dg = c1.g - c2.g
+  const db = c1.b - c2.b
+  return Math.sqrt(dr * dr + dg * dg + db * db)
+}
+
+function retainDiverseCandidates(candidates, limit = 24) {
+  if (candidates.length <= limit) return candidates
+
+  const sorted = candidates.slice().sort((a, b) => b.score - a.score)
+  const selected = []
+  const minColorDistance = 28
+
+  for (const candidate of sorted) {
+    if (selected.length >= limit) break
+
+    const tooSimilar = selected.some(
+      (item) =>
+        item.patternType === candidate.patternType &&
+        colorDistance(item.signatureColor, candidate.signatureColor) <
+          minColorDistance
+    )
+
+    if (!tooSimilar || selected.length < Math.min(6, limit)) {
+      selected.push(candidate)
+    }
+  }
+
+  while (selected.length < limit && selected.length < sorted.length) {
+    selected.push(sorted[selected.length])
+  }
+
+  return selected
+}
+
 async function extractFabricPatchCandidates(cleanBuffer, garmentType) {
   const prepared = await sharp(cleanBuffer)
     .ensureAlpha()
@@ -1035,91 +844,128 @@ async function extractFabricPatchCandidates(cleanBuffer, garmentType) {
   const roiHeight = Math.max(1, bounds.maxY - bounds.minY + 1)
   const base = Math.min(roiWidth, roiHeight)
 
-  const garmentBias = garmentType === 'tshirt' ? 0.42 : 0.5
-  const patchSize = clamp(Math.floor(base * garmentBias), 96, base)
-  const maxLeft = Math.max(bounds.minX, bounds.maxX - patchSize + 1)
-  const maxTop = Math.max(bounds.minY, bounds.maxY - patchSize + 1)
-  const grid = 5
-
+  const profile = getSamplingProfile(garmentType)
+  const grid = profile.grid
+  const centerWeightBand = 0.24
   const candidates = []
+  let candidateIndex = 0
 
-  for (let gy = 0; gy < grid; gy++) {
-    for (let gx = 0; gx < grid; gx++) {
-      const left =
-        grid === 1
-          ? bounds.minX
-          : Math.round(
-              bounds.minX + (gx / (grid - 1)) * (maxLeft - bounds.minX)
-            )
-      const top =
-        grid === 1
-          ? bounds.minY
-          : Math.round(bounds.minY + (gy / (grid - 1)) * (maxTop - bounds.minY))
+  for (const scale of profile.scales) {
+    const patchSize = clamp(Math.floor(base * scale), 96, base)
+    const maxLeft = Math.max(bounds.minX, bounds.maxX - patchSize + 1)
+    const maxTop = Math.max(bounds.minY, bounds.maxY - patchSize + 1)
+    const centerX = bounds.minX + (maxLeft - bounds.minX) * 0.5
+    const centerY = bounds.minY + (maxTop - bounds.minY) * 0.5
 
-      const sample = await sharp(cleanBuffer)
-        .extract({ left, top, width: patchSize, height: patchSize })
-        .resize(CANDIDATE_SIZE, CANDIDATE_SIZE, {
-          fit: 'fill',
-          kernel: sharp.kernel.lanczos3
+    for (let gy = 0; gy < grid; gy++) {
+      for (let gx = 0; gx < grid; gx++) {
+        const left =
+          grid === 1
+            ? bounds.minX
+            : Math.round(
+                bounds.minX + (gx / (grid - 1)) * (maxLeft - bounds.minX)
+              )
+        const top =
+          grid === 1
+            ? bounds.minY
+            : Math.round(
+                bounds.minY + (gy / (grid - 1)) * (maxTop - bounds.minY)
+              )
+
+        const sample = await sharp(cleanBuffer)
+          .extract({ left, top, width: patchSize, height: patchSize })
+          .resize(CANDIDATE_SIZE, CANDIDATE_SIZE, {
+            fit: 'fill',
+            kernel: sharp.kernel.lanczos3
+          })
+          .ensureAlpha()
+          .raw()
+          .toBuffer({ resolveWithObject: true })
+
+        const initialStats = summarizePatch(
+          sample.data,
+          sample.info.width,
+          sample.info.height,
+          sample.info.channels
+        )
+
+        if (initialStats.coverage < 0.72) continue
+
+        const normalized = normalizePatchLighting(
+          sample.data,
+          sample.info.width,
+          sample.info.height,
+          sample.info.channels,
+          initialStats.meanColor
+        )
+
+        const normalizedStats = summarizePatch(
+          normalized,
+          sample.info.width,
+          sample.info.height,
+          sample.info.channels
+        )
+
+        const patternType = detectPatternType(normalizedStats)
+        const baseScore = scoreCandidate(
+          normalized,
+          sample.info.width,
+          sample.info.height,
+          sample.info.channels,
+          { bgColor: normalizedStats.meanColor, foregroundCoverage: 1 }
+        )
+
+        const patternBonus =
+          patternType === 'solid'
+            ? 0.03
+            : patternType === 'weave'
+              ? 0.02
+              : patternType === 'stripe'
+                ? 0.015
+                : 0
+
+        const centerDx = maxLeft === bounds.minX ? 0 : Math.abs(left - centerX)
+        const centerDy = maxTop === bounds.minY ? 0 : Math.abs(top - centerY)
+        const normalizedCenterDx =
+          maxLeft === bounds.minX
+            ? 0
+            : centerDx / Math.max(1, maxLeft - bounds.minX)
+        const normalizedCenterDy =
+          maxTop === bounds.minY
+            ? 0
+            : centerDy / Math.max(1, maxTop - bounds.minY)
+        const centerDistance = Math.sqrt(
+          normalizedCenterDx * normalizedCenterDx +
+            normalizedCenterDy * normalizedCenterDy
+        )
+        const centerBonus =
+          clamp(1 - centerDistance * 1.2, 0, 1) * centerWeightBand
+        const score = clamp(baseScore + patternBonus + centerBonus, 0, 1)
+
+        candidates.push({
+          index: candidateIndex++,
+          buffer: normalized,
+          width: sample.info.width,
+          height: sample.info.height,
+          channels: sample.info.channels,
+          left,
+          top,
+          patchSize,
+          coverage: Number(normalizedStats.coverage.toFixed(4)),
+          score: Number(score.toFixed(4)),
+          scoreBreakdown: {
+            base: Number(baseScore.toFixed(4)),
+            patternBonus: Number(patternBonus.toFixed(4)),
+            centerBonus: Number(centerBonus.toFixed(4))
+          },
+          patternType,
+          signatureColor: quantizeColor(normalizedStats.meanColor)
         })
-        .ensureAlpha()
-        .raw()
-        .toBuffer({ resolveWithObject: true })
-
-      const initialStats = summarizePatch(
-        sample.data,
-        sample.info.width,
-        sample.info.height,
-        sample.info.channels
-      )
-
-      if (initialStats.coverage < 0.72) continue
-
-      const normalized = normalizePatchLighting(
-        sample.data,
-        sample.info.width,
-        sample.info.height,
-        sample.info.channels,
-        initialStats.meanColor
-      )
-
-      const normalizedStats = summarizePatch(
-        normalized,
-        sample.info.width,
-        sample.info.height,
-        sample.info.channels
-      )
-
-      const patternType = detectPatternType(normalizedStats)
-      const baseScore = scoreCandidate(
-        normalized,
-        sample.info.width,
-        sample.info.height,
-        sample.info.channels,
-        { bgColor: normalizedStats.meanColor, foregroundCoverage: 1 }
-      )
-
-      const patternBonus =
-        patternType === 'solid'
-          ? 0.03
-          : patternType === 'weave'
-            ? 0.02
-            : patternType === 'stripe'
-              ? 0.015
-              : 0
-
-      candidates.push({
-        buffer: normalized,
-        width: sample.info.width,
-        height: sample.info.height,
-        channels: sample.info.channels,
-        score: clamp(baseScore + patternBonus, 0, 1),
-        patternType
-      })
+      }
     }
   }
 
-  return candidates
+  return retainDiverseCandidates(candidates, 24)
 }
 
 async function renderFinalTile(candidate) {
@@ -1159,7 +1005,11 @@ async function renderFinalTile(candidate) {
   }
 }
 
-async function extractTextureWithComfyUI(imageBuffer, garmentType) {
+async function extractTextureWithComfyUI(
+  imageBuffer,
+  garmentType,
+  options = {}
+) {
   if (!sharp) {
     throw new Error(
       `sharp unavailable for background removal: ${
@@ -1168,11 +1018,22 @@ async function extractTextureWithComfyUI(imageBuffer, garmentType) {
     )
   }
 
+  const telemetry = {
+    timingsMs: {},
+    candidateCount: 0
+  }
+
+  const bgStart = Date.now()
   const cleanBuffer = await removeBackgroundFromFullImage(imageBuffer)
+  telemetry.timingsMs.backgroundRemoval = Date.now() - bgStart
+
+  const candidateStart = Date.now()
   const candidates = await extractFabricPatchCandidates(
     cleanBuffer,
     garmentType
   )
+  telemetry.timingsMs.candidateExtraction = Date.now() - candidateStart
+  telemetry.candidateCount = candidates.length
 
   if (candidates.length === 0) {
     return {
@@ -1180,17 +1041,39 @@ async function extractTextureWithComfyUI(imageBuffer, garmentType) {
       metadata: {
         pipeline: 'background-only',
         patternType: 'unknown',
-        seamlessScore: 0
+        seamlessScore: 0,
+        telemetry: options.debug ? telemetry : undefined
       }
     }
   }
 
   candidates.sort((a, b) => b.score - a.score)
+  const minSeamlessScore = parseMinScore(
+    options.minSeamlessScore,
+    MIN_SEAMLESS_SCORE
+  )
   const selected =
-    candidates.find((candidate) => candidate.score >= MIN_SEAMLESS_SCORE) ||
+    candidates.find((candidate) => candidate.score >= minSeamlessScore) ||
     candidates[0]
 
+  const renderStart = Date.now()
   const finalTile = await renderFinalTile(selected)
+  telemetry.timingsMs.finalRender = Date.now() - renderStart
+  telemetry.timingsMs.total =
+    telemetry.timingsMs.backgroundRemoval +
+    telemetry.timingsMs.candidateExtraction +
+    telemetry.timingsMs.finalRender
+
+  const topCandidates = candidates.slice(0, 6).map((candidate) => ({
+    index: candidate.index,
+    left: candidate.left,
+    top: candidate.top,
+    patchSize: candidate.patchSize,
+    coverage: candidate.coverage,
+    patternType: candidate.patternType,
+    score: candidate.score,
+    scoreBreakdown: candidate.scoreBreakdown
+  }))
 
   return {
     buffer: finalTile.buffer,
@@ -1198,7 +1081,24 @@ async function extractTextureWithComfyUI(imageBuffer, garmentType) {
       pipeline: 'patch-tile',
       patternType: finalTile.patternType,
       seamlessScore: Number(finalTile.seamlessScore.toFixed(3)),
-      tileSize: FINAL_TILE_SIZE
+      tileSize: FINAL_TILE_SIZE,
+      minSeamlessScore,
+      selectedCandidate: {
+        index: selected.index,
+        left: selected.left,
+        top: selected.top,
+        patchSize: selected.patchSize,
+        coverage: selected.coverage,
+        score: selected.score,
+        scoreBreakdown: selected.scoreBreakdown,
+        patternType: selected.patternType
+      },
+      telemetry: options.debug
+        ? {
+            ...telemetry,
+            topCandidates
+          }
+        : undefined
     }
   }
 }
@@ -1216,10 +1116,17 @@ app.post('/process-garment', upload.single('image'), async (req, res) => {
       console.log('Garment type:', latestGarment)
     }
 
+    const debug = toBooleanFlag(req.body.debug, DEFAULT_DEBUG_MODE)
+    const minSeamlessScore = parseMinScore(
+      req.body.minSeamlessScore,
+      MIN_SEAMLESS_SCORE
+    )
+
     console.log('Extracting texture...')
     const result = await extractTextureWithComfyUI(
       req.file.buffer,
-      latestGarment
+      latestGarment,
+      { debug, minSeamlessScore }
     )
     const textureBuffer = result.buffer
 
@@ -1242,7 +1149,10 @@ app.post('/process-garment', upload.single('image'), async (req, res) => {
       texture: textureUrl,
       patternType: result.metadata.patternType,
       seamlessScore: result.metadata.seamlessScore,
-      pipeline: result.metadata.pipeline
+      pipeline: result.metadata.pipeline,
+      minSeamlessScore: result.metadata.minSeamlessScore,
+      selectedCandidate: result.metadata.selectedCandidate,
+      telemetry: debug ? result.metadata.telemetry : undefined
     })
   } catch (error) {
     console.error('Failed:', error)
