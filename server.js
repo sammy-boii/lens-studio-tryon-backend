@@ -55,6 +55,7 @@ let textureVersion = 0
 
 const CANDIDATE_SIZE = 256
 const FINAL_TILE_SIZE = 1024
+const FINAL_TILE_GRID = 6
 const MIN_SEAMLESS_SCORE = 0.42
 const DEFAULT_DEBUG_MODE = false
 
@@ -984,19 +985,55 @@ async function renderFinalTile(candidate) {
     { foregroundCoverage: 1 }
   )
 
-  const buffer = await sharp(refined, {
+  const perTileSize = Math.max(1, Math.floor(FINAL_TILE_SIZE / FINAL_TILE_GRID))
+
+  const singleTileBuffer = await sharp(refined, {
     raw: {
       width: candidate.width,
       height: candidate.height,
       channels: candidate.channels
     }
   })
-    .resize(FINAL_TILE_SIZE, FINAL_TILE_SIZE, {
+    .resize(perTileSize, perTileSize, {
       fit: 'fill',
       kernel: sharp.kernel.lanczos3
     })
     .png()
     .toBuffer()
+
+  const composites = []
+  for (let row = 0; row < FINAL_TILE_GRID; row++) {
+    for (let col = 0; col < FINAL_TILE_GRID; col++) {
+      composites.push({
+        input: singleTileBuffer,
+        left: col * perTileSize,
+        top: row * perTileSize
+      })
+    }
+  }
+
+  let buffer = await sharp({
+    create: {
+      width: perTileSize * FINAL_TILE_GRID,
+      height: perTileSize * FINAL_TILE_GRID,
+      channels: 4,
+      background: { r: 255, g: 255, b: 255, alpha: 1 }
+    }
+  })
+    .composite(composites)
+    .png()
+    .toBuffer()
+
+  // Keep output dimensions stable for consumers if integer division changes edge size.
+  if (perTileSize * FINAL_TILE_GRID !== FINAL_TILE_SIZE) {
+    buffer = await sharp(buffer)
+      .resize(FINAL_TILE_SIZE, FINAL_TILE_SIZE, {
+        fit: 'fill',
+        kernel: sharp.kernel.lanczos3
+      })
+      .png()
+      .toBuffer()
+  }
 
   return {
     buffer,
@@ -1082,6 +1119,7 @@ async function extractTextureWithComfyUI(
       patternType: finalTile.patternType,
       seamlessScore: Number(finalTile.seamlessScore.toFixed(3)),
       tileSize: FINAL_TILE_SIZE,
+      tileGrid: FINAL_TILE_GRID,
       minSeamlessScore,
       selectedCandidate: {
         index: selected.index,
