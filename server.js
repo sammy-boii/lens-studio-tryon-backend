@@ -20,7 +20,7 @@ try {
 }
 
 const app = express()
-const PORT = process.env.PORT || 3000
+const PORT = 3000
 
 app.use(cors({ origin: '*' }))
 
@@ -1177,8 +1177,7 @@ app.post('/process-garment', upload.single('image'), async (req, res) => {
 
     console.log('Saved:', filename)
 
-    const BASE_URL =
-      process.env.BASE_URL || `${req.protocol}://${req.get('host')}`
+    const BASE_URL = 'https://lens-studio-tryon-backend.onrender.com'
 
     const textureUrl = `${BASE_URL}/textures/${filename}`
 
